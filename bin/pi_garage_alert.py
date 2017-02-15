@@ -1,7 +1,8 @@
 #!/usr/bin/python2.7
 """ Pi Garage Alert
 
-Author: Richard L. Lynch <rich@richlynch.com>
+Original Author: Richard L. Lynch <rich@richlynch.com>
+Modifications by: Robert LaThanh
 
 Description: Emails, tweets, or sends an SMS if a garage door is left open
 too long.
@@ -14,6 +15,7 @@ Learn more at http://www.richlynch.com/code/pi_garage_alert
 # The MIT License (MIT)
 #
 # Copyright (c) 2013-2014 Richard L. Lynch <rich@richlynch.com>
+# Copyright (c) 2017 Robert LaThanh
 #
 # Permission is hereby granted, free of charge, to any person obtaining a
 # copy of this software and associated documentation files (the "Software"),
@@ -141,13 +143,12 @@ if sys.version_info < (3, 0):
 class Jabber(sleekxmpp.ClientXMPP):
     """Interfaces with a Jabber instant messaging service"""
 
-    def __init__(self, door_states, time_of_last_state_change):
+    def __init__(self, doors):
         self.logger = logging.getLogger(__name__)
         self.connected = False
 
-        # Save references to door states for status queries
-        self.door_states = door_states
-        self.time_of_last_state_change = time_of_last_state_change
+        # Keep references to doors list for status queries
+        self.doors = doors
 
         if not hasattr(cfg, 'JABBER_ID'):
             self.logger.debug("Jabber ID not defined - Jabber support disabled")
@@ -250,11 +251,10 @@ class Jabber(sleekxmpp.ClientXMPP):
                 if msg['body'].lower() == 'status':
                     # Generate status report
                     states = []
-                    for door in cfg.GARAGE_DOORS:
-                        name = door['name']
-                        state = self.door_states[name]
-                        how_long = time.time() - self.time_of_last_state_change[name]
-                        states.append("%s: %s (%s)" % (name, state, format_duration(how_long)))
+                    for door in self.doors:
+                        how_long = time.time() - door.time_of_last_state_change
+                        states.append("%s: %s (%s)" % (door.name, door.state,
+                                                       format_duration(how_long)))
                     response = ' / '.join(states)
                 else:
                     # Invalid command received
@@ -374,7 +374,7 @@ class Twitter(object):
                 self.logger.error("Unable to send Tweet: %s", ex)
 
     def update_status(self, msg):
-        """Update the users's status
+        """Update the user's status
 
         Args:
             msg: New status to set. Long messages will automatically be truncated.
@@ -420,10 +420,14 @@ class Email(object):
 
         try:
             mail = smtplib.SMTP(cfg.SMTP_SERVER, cfg.SMTP_PORT)
+            mail.ehlo()
+            if cfg.SMTP_IS_TLS:
+                mail.starttls()
+                mail.ehlo()
             if cfg.SMTP_USER != '' and cfg.SMTP_PASS != '':
                 mail.login(cfg.SMTP_USER, cfg.SMTP_PASS)
             mail.sendmail(cfg.EMAIL_FROM, recipient, msg.as_string())
-            mail.quit()
+            mail.close()
         except:
             self.logger.error("Exception sending email: %s", sys.exc_info()[0])
 
@@ -655,6 +659,25 @@ def format_duration(duration_sec):
 ##############################################################################
 # Main functionality
 ##############################################################################
+class Door:
+    """Contains everything about a door.
+
+     Contains the fixed properties of a door (e.g., which pin it's attached to)
+     as well and it's state properties (e.g., whether it's open or closed, and
+     when it was last open/closed).
+    """
+    def __init__(self, door_cfg, initial_state):
+        #-- Fixed properties about the door
+        self.logger = logging.getLogger(__name__)
+        self.pin = door_cfg['pin']
+        self.name = door_cfg['name']
+        self.recipients = door_cfg['recipients']
+
+        #-- Door state
+        self.state = initial_state
+        self.time_of_last_state_change = time.time()
+        self.alert_still_open_index = 0
+
 class PiGarageAlert(object):
     """Class with main function of Pi Garage Alert"""
 
@@ -690,18 +713,11 @@ class PiGarageAlert(object):
                 self.logger.info("Configuring pin %d for \"%s\"", door['pin'], door['name'])
                 GPIO.setup(door['pin'], GPIO.IN, pull_up_down=GPIO.PUD_UP)
 
-            # Last state of each garage door
-            door_states = dict()
-
-            # time.time() of the last time the garage door changed state
-            time_of_last_state_change = dict()
-
-            # Index of the next alert to send for each garage door
-            alert_states = dict()
+            doors = []
 
             # Create alert sending objects
             alert_senders = {
-                "Jabber": Jabber(door_states, time_of_last_state_change),
+                "Jabber": Jabber(doors),
                 "Twitter": Twitter(),
                 "Twilio": Twilio(),
                 "Email": Email(),
@@ -711,57 +727,78 @@ class PiGarageAlert(object):
                 "Gcm": GoogleCloudMessaging()
             }
 
-            # Read initial states
-            for door in cfg.GARAGE_DOORS:
-                name = door['name']
-                state = get_garage_door_state(door['pin'])
+            # Read in door config
+            for door_cfg in cfg.GARAGE_DOORS:
+                name = door_cfg['name']
+                initial_state = get_garage_door_state(door_cfg['pin'])
 
-                door_states[name] = state
-                time_of_last_state_change[name] = time.time()
-                alert_states[name] = 0
+                doors.append(Door(door_cfg, initial_state))
 
-                self.logger.info("Initial state of \"%s\" is %s", name, state)
+                self.logger.info("Initial state of \"%s\" is %s",
+                                 name, initial_state)
 
+            # Ready to poll and alert!
+            # Poll doors every second for updated state
             status_report_countdown = 5
             while True:
-                for door in cfg.GARAGE_DOORS:
-                    name = door['name']
-                    state = get_garage_door_state(door['pin'])
-                    time_in_state = time.time() - time_of_last_state_change[name]
+                for door in doors:
+                    name = door.name
+                    state = get_garage_door_state(door.pin)
+                    now = time.time()
+                    time_in_state = now - door.time_of_last_state_change
 
                     # Check if the door has changed state
-                    if door_states[name] != state:
-                        door_states[name] = state
-                        time_of_last_state_change[name] = time.time()
+                    if door.state == "closed" and state == "closed":
+                        #-- door has remained closed.
+                        pass
+
+                    elif door.state == "closed" and state == "open":
+                        #-- door has opened!
+                        # save new state
+                        door.state = state
+                        door.time_of_last_state_change = now
                         self.logger.info("State of \"%s\" changed to %s after %.0f sec", name, state, time_in_state)
 
-                        # Reset alert when door changes state
-                        if alert_states[name] > 0:
-                            # Use the recipients of the last alert
-                            recipients = door['alerts'][alert_states[name] - 1]['recipients']
-                            send_alerts(self.logger, alert_senders, recipients, name, "%s is now %s" % (name, state), state, 0)
-                            alert_states[name] = 0
+                        # prepare and send alert
+                        now_string = strftime("%Y-%m-%d %H:%M:%S", time.localtime(door.time_of_last_state_change))
+                        subject = "%s opening %s" % (door.name, now_string)
+                        message = "%s opened at %s" % (door.name, now_string)
+                        if time_in_state > 0:
+                            message += " (after being closed for " + format_duration(time_in_state) + ")"
+                        send_alerts(self.logger, alert_senders, door.recipients,
+                                    subject, message, "open", time_in_state)
 
-                        # Reset time_in_state
-                        time_in_state = 0
+                    elif door.state == "open" and state == "closed":
+                        #-- door has closed!
+                        time_opened = door.time_of_last_state_change
 
-                    # See if there are more alerts
-                    if len(door['alerts']) > alert_states[name]:
-                        # Get info about alert
-                        alert = door['alerts'][alert_states[name]]
+                        # save new state
+                        door.state = state
+                        door.time_of_last_state_change = now
+                        self.logger.info("State of \"%s\" changed to %s after %.0f sec", name, state, time_in_state)
 
-                        # Has the time elapsed and is this the state to trigger the alert?
-                        if time_in_state > alert['time'] and state == alert['state']:
-                            send_alerts(self.logger, alert_senders, alert['recipients'], name, "%s has been %s for %d seconds!" % (name, state, time_in_state), state, time_in_state)
-                            alert_states[name] += 1
+                        # prepare and send alert
+                        time_opened_string = strftime("%Y-%m-%d %H:%M:%S", time.localtime(time_opened))
+                        now_string = strftime("%Y-%m-%d %H:%M:%S", time.localtime(now))
+                        subject = "%s opening %s" % (door.name, time_opened_string)
+                        message = "%s closed at %s (was open for %s)" % (door.name, now_string, format_duration(time_in_state))
+                        send_alerts(self.logger, alert_senders, door.recipients,
+                                    subject, message, "closed", time_in_state)
 
-                # Periodically log the status for debug and ensuring RPi doesn't get too hot
+                    else:
+                        #-- door is still open
+                        pass
+                #end for doors
+
+                # Periodically log the status for debug and to see if  RPi gets too hot
                 status_report_countdown -= 1
                 if status_report_countdown <= 0:
                     status_msg = rpi_status()
 
-                    for name in door_states:
-                        status_msg += ", %s: %s/%d/%d" % (name, door_states[name], alert_states[name], (time.time() - time_of_last_state_change[name]))
+                    for door in doors:
+                        status_msg += \
+                            ", %s: %s/%d/%d" % (door.name, door.state, -1,
+                                                (time.time() - door.time_of_last_state_change))
 
                     self.logger.info(status_msg)
 
